@@ -1,36 +1,79 @@
 import argparse
 import torch
+import time
 import torch.nn.functional as F
-from torch_geometric.utils import scatter
+import torch_geometric
+from torch_geometric.utils import scatter,to_scipy_sparse_matrix
 from ogb.nodeproppred import PygNodePropPredDataset, Evaluator
-from torch_geometric.nn import ChebConv, GCNConv
+from torch_geometric.nn import ChebConv, GCNConv, Linear
 from torch_geometric.nn import GATConv,SGConv,SuperGATConv, ClusterGCNConv
 from torch_geometric.nn import GCNConv, ChebConv, GraphConv, GATConv, TransformerConv, SGConv, ClusterGCNConv, \
     FiLMConv, SuperGATConv, GATv2Conv, ARMAConv
+from torch_geometric.datasets import KarateClub
+from gcn.nets.layers import LinearCombinationLayer, ConcatLinearTransformationLayer,GraphConvolution
+from torch.profiler import profile, record_function, ProfilerActivity
+from torch_geometric.utils import subgraph
+import numpy as np
+from torch.cuda.amp import autocast, GradScaler
+import gc
 
-from gcn.nets.layers import CascadeLayer, LinearCombinationLayer, ConcatLinearTransformationLayer,GraphConvolution
 
 from torch_scatter import scatter_mean
 
+# Assuming the necessary model classes (GAT, Cheby, GCN, etc.) are imported
+# from your_model_library import GAT, Cheby, GCN, SGC, SSobGNN, ClusterGCN, SuperGAT, Transformer, GATv2
+
+def get_model(model_name, in_channels, out_channels, num_layers, args):
+
+    device = f'cuda:{args.device}' if torch.cuda.is_available() else 'cpu'
+    device = torch.device(device)
+
+    if model_name == 'GAT':
+        return GAT(in_channels, out_channels, num_layers, args).to(device)
+    elif model_name == 'Cheby':
+        return Cheby(in_channels, out_channels, num_layers, args).to(device)
+    elif model_name == 'GCN':
+        return GCN(in_channels, out_channels, num_layers, args).to(device)
+    elif model_name == 'SGC':
+        return SGC(in_channels, out_channels, num_layers, args).to(device)
+    elif model_name == 'SSobGNN':
+        return SSobGNN(in_channels, out_channels, num_layers, args).to(device)
+    elif model_name == 'ClusterGCN':
+        return ClusterGCN(in_channels, out_channels, num_layers, args).to(device)
+    elif model_name == 'SuperGAT':
+        return SuperGAT(in_channels, out_channels, num_layers, args).to(device)
+    elif model_name == 'Transformer':
+        return Transformer(in_channels, out_channels, num_layers, args).to(device)
+    elif model_name == 'GATv2':
+        return GATv2(in_channels, out_channels, num_layers, args).to(device)
+    else:
+        raise ValueError(f"Unknown model: {model_name}")
+
+
 class Logger(object):
-    def __init__(self, runs, info=None):
+    def __init__(self, runs, info=None, file_name='results.txt'):
         self.info = info
         self.results = [[] for _ in range(runs)]
+        self.file = open(file_name, 'a')  # Open the file in append mode
 
     def add_result(self, run, result):
         assert len(result) == 3
         assert run >= 0 and run < len(self.results)
         self.results[run].append(result)
 
+    def _write_to_file(self, message):
+        self.file.write(message + '\n')
+        print(message)  # Optionally print to console as well
+
     def print_statistics(self, run=None):
         if run is not None:
             result = 100 * torch.tensor(self.results[run])
             argmax = result[:, 1].argmax().item()
-            print(f'Run {run + 1:02d}:')
-            print(f'Highest Train: {result[:, 0].max():.2f}')
-            print(f'Highest Valid: {result[:, 1].max():.2f}')
-            print(f'  Final Train: {result[argmax, 0]:.2f}')
-            print(f'   Final Test: {result[argmax, 2]:.2f}')
+            self._write_to_file(f'Run {run + 1:02d}:')
+            self._write_to_file(f'Highest Train: {result[:, 0].max():.2f}')
+            self._write_to_file(f'Highest Valid: {result[:, 1].max():.2f}')
+            self._write_to_file(f'  Final Train: {result[argmax, 0]:.2f}')
+            self._write_to_file(f'   Final Test: {result[argmax, 2]:.2f}')
         else:
             result = 100 * torch.tensor(self.results)
 
@@ -44,16 +87,53 @@ class Logger(object):
 
             best_result = torch.tensor(best_results)
 
-            print(f'All runs:')
+            self._write_to_file(f'All runs:')
             r = best_result[:, 0]
-            print(f'Highest Train: {r.mean():.2f} ± {r.std():.2f}')
+            self._write_to_file(f'Highest Train: {r.mean():.2f} ± {r.std():.2f}')
             r = best_result[:, 1]
-            print(f'Highest Valid: {r.mean():.2f} ± {r.std():.2f}')
+            self._write_to_file(f'Highest Valid: {r.mean():.2f} ± {r.std():.2f}')
             r = best_result[:, 2]
-            print(f'  Final Train: {r.mean():.2f} ± {r.std():.2f}')
+            self._write_to_file(f'  Final Train: {r.mean():.2f} ± {r.std():.2f}')
             r = best_result[:, 3]
-            print(f'   Final Test: {r.mean():.2f} ± {r.std():.2f}')
+            self._write_to_file(f'   Final Test: {r.mean():.2f} ± {r.std():.2f}')
 
+    def close(self):
+        self.file.close()
+
+
+            
+class CascadeLayer(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, args):
+        super(CascadeLayer, self).__init__()
+
+        self.lin = torch.nn.Linear(in_channels, out_channels)
+        self.convs = torch.nn.ModuleList()
+        for _ in range(args.alpha):
+            self.convs.append(GCNConv(out_channels, out_channels, cached=False, add_self_loops=False))
+
+        self.dropout = args.dropout
+
+    def forward(self, x, data):
+        edge_indexs, edge_attrs = data.edge_index, data.edge_attr
+        hs = []
+
+
+        h = self.lin(x)
+        h = F.relu(h)
+        h = F.dropout(h, p=self.dropout, training=self.training)
+        hs.append(h)
+
+
+        for i, conv in enumerate(self.convs):
+            h = conv(h, edge_indexs[i], edge_weight=edge_attrs[i])
+            h = F.relu(h)
+            h = F.dropout(h, p=self.dropout, training=self.training)
+            hs.append(h)
+
+            
+
+        return hs
+    
 class Cheby(torch.nn.Module):
     def __init__(self, in_channels, out_channels, number_layers, args):
         super(Cheby, self).__init__()
@@ -77,38 +157,9 @@ class Cheby(torch.nn.Module):
         for i, conv in enumerate(self.convs):
             x = conv(x, edge_index)
             x = F.relu(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-        
+            x = F.dropout(x, p=self.dropout, training=self.training)        
         return F.log_softmax(x, dim=-1)
 
-class GAT(torch.nn.Module):
-    def __init__(self, in_channels, out_channels, number_layers, args):
-        super(GAT, self).__init__()
-
-        self.heads = 1
-        self.hidden_units = args.hidden_channels
-        self.dropout = args.dropout
-
-        self.convs = torch.nn.ModuleList()
-        self.convs.append(GATConv(in_channels, self.hidden_units, heads=self.heads, concat=False))
-        for _ in range(number_layers - 2):
-            self.convs.append(GATConv(self.hidden_units, self.hidden_units, heads=self.heads, concat=False))
-        self.convs.append(GATConv(self.hidden_units, out_channels, heads=self.heads, concat=False))
-
-    def reset_parameters(self):
-        for conv in self.convs:
-            conv.reset_parameters()
-
-    def forward(self, data):
-        x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
-        for i, conv in enumerate(self.convs):
-            print(f"Before conv {i + 1}: x.shape = {x.shape}, edge_index.shape = {edge_index.shape}, edge_attr.shape = {edge_attr.shape}")
-            x = conv(x, edge_index)
-            print(f"After conv {i + 1}: x.shape = {x.shape}")
-            x = F.relu(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-
-        return F.log_softmax(x, dim=-1)
 
 
 class GCN(torch.nn.Module):
@@ -147,7 +198,8 @@ class SGC(torch.nn.Module):
 
     def forward(self, data):
         x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
-        x = self.conv(x, edge_index, edge_weight=edge_attr)
+        edge_weight = edge_attr.mean(dim=1)  # Computing the mean across features for each edge
+        x = self.conv(x, edge_index, edge_weight=edge_weight)
         x = F.relu(x)
         x = F.dropout(x, p=self.dropout, training=self.training)
 
@@ -201,7 +253,7 @@ class ClusterGCN(torch.nn.Module):
             self.convs.append(ClusterGCNConv(args.hidden_channels, args.hidden_channels))
         self.convs.append(ClusterGCNConv(args.hidden_channels, out_channels))
 
-        self.dropout = args["dropout"]
+        self.dropout = args.dropout
 
     def forward(self, data):
         x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
@@ -209,7 +261,7 @@ class ClusterGCN(torch.nn.Module):
             x = conv(x, edge_index)
             x = F.relu(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
-        return x.log_softmax(dim=-1)
+        return torch.sigmoid(x)
     
 
 class SSobGNN(torch.nn.Module):
@@ -223,26 +275,28 @@ class SSobGNN(torch.nn.Module):
     def __init__(self, in_channels, out_channels, number_layers, args):
         super(SSobGNN, self).__init__()
 
-        self.aggregation = args["aggregation"]
+        #self.aggregation = args["aggregation"]
+        self.aggregation = 'linear'
 
         self.convs = torch.nn.ModuleList()
-        self.convs.append(CascadeLayer(in_channels, args["hidden_units"], args))
+        self.concat_layers = torch.nn.ModuleList()
+        self.convs.append(CascadeLayer(in_channels, args.hidden_channels, args))
         for _ in range(number_layers - 2):
-            self.convs.append(CascadeLayer(args["hidden_units"], args["hidden_units"], args))
-        self.convs.append(CascadeLayer(args["hidden_units"], out_channels, args))
+            self.convs.append(CascadeLayer(args.hidden_channels, args.hidden_channels, args))
+        self.convs.append(CascadeLayer(args.hidden_channels, out_channels, args))
         #self.convs.append(torch.nn.Linear(2,out_channels))
         
-        #self.convs.append(torch.nn.Linear(args["hidden_units"],out_channels))
+        #self.convs.append(torch.nn.Linear(args.hidden_channels,out_channels))
 
-        if args["aggregation"] == 'linear':
+        if args.aggregation == 'linear':
             self.linear_combination_layers = torch.nn.ModuleList()
             for _ in range(number_layers):
-                self.linear_combination_layers.append(LinearCombinationLayer(args["alpha"]))
-        if args["aggregation"] == 'concat':
+                self.linear_combination_layers.append(LinearCombinationLayer(args.alpha))
+        if args.aggregation == 'concat':
             self.concat_layers = torch.nn.ModuleList()
             for _ in range(number_layers-1):
-                self.concat_layers.append(ConcatLinearTransformationLayer(args["alpha"], args["hidden_units"], args["hidden_units"]))
-            self.concat_layers.append(ConcatLinearTransformationLayer(args["alpha"], out_channels, out_channels))
+                self.concat_layers.append(ConcatLinearTransformationLayer(args.alpha, args.hidden_channels, args.hidden_channels))
+            self.concat_layers.append(ConcatLinearTransformationLayer(args.alpha, out_channels, out_channels))
 
 
         
@@ -255,16 +309,103 @@ class SSobGNN(torch.nn.Module):
             if self.aggregation == 'concat':
                 x = self.concat_layers[i](hs)
         return x.log_softmax(dim=-1)
+    
+class GAT(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, number_layers, args):
+        super(GAT, self).__init__()
 
-def train(model, data, y_true, train_idx, optimizer):
+        # Assuming args contains the heads, hidden_channels, and dropout values
+        self.heads = 1  # Reduce the number of heads to reduce memory usage
+        self.hidden_units = max(8, args.hidden_channels // 2)  # Reduce hidden units
+        self.dropout = args.dropout
+
+        self.convs = torch.nn.ModuleList()
+        self.convs.append(GATConv(in_channels, self.hidden_units, heads=self.heads, concat=False))
+        for _ in range(number_layers - 2):
+            self.convs.append(GATConv(self.hidden_units, self.hidden_units, heads=self.heads, concat=False))
+        self.convs.append(GATConv(self.hidden_units, out_channels, heads=self.heads, concat=False))
+
+    def reset_parameters(self):
+        for conv in self.convs:
+            conv.reset_parameters()
+
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index
+        for conv in self.convs[:-1]:
+            x = conv(x, edge_index)
+            x = F.relu(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+
+        
+        # Final layer
+
+        x = self.convs[-1](x, edge_index)
+
+        return torch.sigmoid(x)
+    
+class Transformer(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, number_layers, args):
+        super(Transformer, self).__init__()
+
+        self.convs = torch.nn.ModuleList()
+        self.convs.append(TransformerConv(in_channels, args.hidden_channels, heads=1, concat=False))
+        for _ in range(number_layers - 2):
+            self.convs.append(TransformerConv(args.hidden_channels, args.hidden_channels, heads=1, concat=False))
+        self.convs.append(TransformerConv(args.hidden_channels, out_channels, heads=1, concat=False))
+
+        self.dropout = args.dropout
+
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index
+        for conv in self.convs[:-1]:
+            x = conv(x, edge_index)
+            x = F.relu(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+        
+        # Use the last convolutional layer
+        x = self.convs[-1](x, edge_index)
+
+        # Apply sigmoid activation for multi-label classification
+        return torch.sigmoid(x)
+
+class GATv2(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, number_layers, args):
+        super(GATv2, self).__init__()
+
+        self.convs = torch.nn.ModuleList()
+        self.convs.append(GATv2Conv(in_channels, args.hidden_channels, heads=1, concat=False))
+        for _ in range(number_layers - 2):
+            self.convs.append(GATv2Conv(args.hidden_channels, args.hidden_channels, heads=1, concat=False))
+        self.convs.append(GATv2Conv(args.hidden_channels, out_channels, heads=1, concat=False))
+
+        self.dropout = args.dropout
+
+    def forward(self, data):
+        x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
+        for i, conv in enumerate(self.convs):
+            x = conv(x, edge_index)
+            x = F.relu(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+        
+        # Using sigmoid for multi-label classification
+        return torch.sigmoid(x)
+    
+
+def train(model, data, y_true, train_idx, optimizer, scaler):
     model.train()
     criterion = torch.nn.BCEWithLogitsLoss()
 
     optimizer.zero_grad()
-    out = model(data)[train_idx]
-    loss = criterion(out, y_true[train_idx].to(torch.float))
-    loss.backward()
-    optimizer.step()
+
+    with autocast():
+        out = model(data)[train_idx]
+        loss = criterion(out, y_true[train_idx].float())
+
+    scaler.scale(loss).backward()
+    scaler.step(optimizer)
+    scaler.update()
+
+    gc.collect()
 
     return loss.item()
 
@@ -289,87 +430,131 @@ def test(model, data, y_true, split_idx, evaluator):
 
     return train_rocauc, valid_rocauc, test_rocauc
 
-    '''
-    adj = to_scipy_sparse_matrix(data.edge_index)
-    new_edges = []
-    for i in range(1,adj.shape[0]+1):
-         new_edges.append(torch.tensor([[i, i]], dtype=torch.long).t())
     
-    edge_index_temp = torch.cat([data.edge_index] + new_edges, dim=1)
-    data.edge_attrs = []
-    edge_attributes = []
-    edge_index = []
-    alpha = 6
-    epsilon = 1.5 
-    for rho in range(1, alpha+1):
-         edge_index.append(edge_index_temp)
-         sparse_sobolev_term = torch.pow(torch.full_like(edge_index_temp[0], epsilon), rho)
-         edge_attributes.append(sparse_sobolev_term.to(float))
+def create_subgraph(data, subset_percentage):
+    # Calculate the number of nodes in the subset
+    #num_nodes_subset = int(subset_percentage * data.num_nodes)
+    num_nodes_subset = 10000
+    # Select a subset of nodes based on the calculated number
+    subset_nodes = torch.arange(num_nodes_subset)
+
+    # Extract the subgraph
+    subset_edge_index, subset_edge_attr = subgraph(subset_nodes, data.edge_index, edge_attr=data.edge_attr, num_nodes=data.num_nodes)
+
+    # Create a new data object for the subgraph
+    subset_data = torch_geometric.data.Data(
+        x=data.x[subset_nodes],
+        edge_index=subset_edge_index,
+        edge_attr=subset_edge_attr,
+        y=data.y[subset_nodes]
+    )
+
+    return subset_data
+
+def random_split(data, train_percent, val_percent, test_percent):
+    num_nodes = data.num_nodes
+    indices = np.random.permutation(num_nodes)
     
-    '''
+    train_size = int(train_percent * num_nodes)
+    val_size = int(val_percent * num_nodes)
+    
+    train_idx = torch.tensor(indices[:train_size], dtype=torch.long)
+    val_idx = torch.tensor(indices[train_size:train_size + val_size], dtype=torch.long)
+    test_idx = torch.tensor(indices[train_size + val_size:], dtype=torch.long)
+    
+    return {'train': train_idx, 'valid': val_idx, 'test': test_idx}
+
 
 def main():
+    
+
     parser = argparse.ArgumentParser(description='OGBN-Proteins (Cheby)')
+    parser.add_argument('--model', type=str, default='Cheby',
+                            help='Name of graph neural network: SSobGNN, SobGNN, GCN, Cheby, kGNN,'
+                                'GAT, Transformer, SGC, ClusterGCN, FiLM, SuperGAT, GATv2, ARMA, SIGN')
+    parser.add_argument('--aggregation', type=str, default='linear')
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--log_steps', type=int, default=1)
     parser.add_argument('--num_layers', type=int, default=3)
-    parser.add_argument('--hidden_channels', type=int, default=256)
+    parser.add_argument('--hidden_channels', type=int, default=8)
     parser.add_argument('--dropout', type=float, default=0.5)
-    parser.add_argument('--lr', type=float, default=0.01)
-    parser.add_argument('--epochs', type=int, default=1000)
-    parser.add_argument('--eval_steps', type=int, default=5)
-    parser.add_argument('--runs', type=int, default=5)
-    parser.add_argument('--K_Cheby', type=int, default=1)
+    parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--epochs', type=int, default=500)
+    parser.add_argument('--eval_steps', type=int, default=10)
+    parser.add_argument('--runs', type=int, default=11)
+    parser.add_argument('--K_Cheby', type=int, default=4)
+    parser.add_argument('--alpha', type=int, default=6)
     args = parser.parse_args()
     print(args)
 
+    
     device = f'cuda:{args.device}' if torch.cuda.is_available() else 'cpu'
     device = torch.device(device)
 
     dataset = PygNodePropPredDataset(name='ogbn-proteins')
-    split_idx = dataset.get_idx_split()
+    
     data = dataset[0]
-
+    # Example usage
+    
     x = scatter(data.edge_attr, data.edge_index[0], dim=0,
                 dim_size=data.num_nodes, reduce='mean').to(device)
 
-    '''
-    adj = to_scipy_sparse_matrix(data.edge_index)
-    new_edges = []
-    for i in range(1,adj.shape[0]+1):
-         new_edges.append(torch.tensor([[i, i]], dtype=torch.long).t())
-    
-    edge_index_temp = torch.cat([data.edge_index] + new_edges, dim=1)
-    data.edge_attrs = []
-    edge_attributes = []
-    edge_index = []
-    alpha = 6
-    epsilon = 1.5 
-    for rho in range(1, alpha+1):
-         edge_index.append(edge_index_temp)
-         sparse_sobolev_term = torch.pow(torch.full_like(edge_index_temp[0], epsilon), rho)
-         edge_attributes.append(sparse_sobolev_term.to(float))
-    
-    '''
-
+  
     data.x = x
+    data = create_subgraph(data, subset_percentage=0.3)
     data.edge_index = data.edge_index.to(device)
     data.edge_attr = data.edge_attr.to(device)
     data.y = data.y.to(device)
+
     
-    train_idx = split_idx['train'].to(device)
+    if args.model == 'SSobGNN':
+        adj = to_scipy_sparse_matrix(data.edge_index)
+        new_edges = []
+        for i in range(adj.shape[0]):  # Changed from 1 to 0 to ensure correct indexing
+            new_edges_tensor = torch.tensor([[i, i]], dtype=torch.long).t()
+            new_edges_tensor = new_edges_tensor.to(device)  # Move tensor to the same device as data
+            new_edges.append(new_edges_tensor)
+        
+        edge_index_temp = torch.cat([data.edge_index] + new_edges, dim=1)
+        edge_attributes = []
+        edge_index = []
+        alpha = 6
+        epsilon = 1.5 
+        for rho in range(1, alpha + 1):
+            edge_index.append(edge_index_temp)
+            sparse_sobolev_term = torch.pow(torch.full_like(edge_index_temp[0], epsilon, dtype=torch.float), rho)
+            sparse_sobolev_term = sparse_sobolev_term.to(device)  # Ensure correct device and dtype
+            edge_attributes.append(sparse_sobolev_term)
+    
+        data.edge_attr = edge_attributes
+        data.edge_index = edge_index
+
+    
+    # Use random_node_split for splitting the dataset
+    split_idx = random_split(data, train_percent=0.6, val_percent=0.2, test_percent=0.2)
+
+    # Now you can use train_idx, val_idx, and test_idx in your training and evaluation loops
+    train_idx = split_idx['train']
+    val_idx = split_idx['valid']
+    test_idx = split_idx['test']
     torch.cuda.empty_cache()
-    model = Cheby(x.size(-1), 112, args.num_layers, args).to(device)
+    
+    model = get_model(args.model, x.size(-1), 112, args.num_layers, args).to(device)
+
 
     evaluator = Evaluator(name='ogbn-proteins')
     logger = Logger(args.runs, args)
+    scaler = GradScaler()
 
-    for run in range(args.runs):
-        #model.reset_parameters()
-        print(torch.cuda.memory_summary(device))
+    for run in range(args.runs):  # Use args.runs instead of hardcoded 11
+        start_time = time.time()  # Start time of the run
+
+        # Reset model parameters for each run, if applicable
+        model = get_model(args.model, x.size(-1), 112, args.num_layers, args).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
         for epoch in range(1, 1 + args.epochs):
-            loss = train(model, data, data.y, train_idx, optimizer)
+            loss = train(model, data, data.y, train_idx, optimizer, scaler)
 
             if epoch % args.eval_steps == 0:
                 result = test(model, data, data.y, split_idx, evaluator)
@@ -384,8 +569,16 @@ def main():
                           f'Valid: {100 * valid_rocauc:.2f}% '
                           f'Test: {100 * test_rocauc:.2f}%')
 
+        gc.collect()
+        end_time = time.time()  # End time of the run
+        run_time = end_time - start_time  # Calculate the time taken for this run
+        print(f'Time for run {run + 1:02d}: {run_time:.2f} seconds')  # Print the time for the run
+
         logger.print_statistics(run)
     logger.print_statistics()
 
+    logger.close()
+
 if __name__ == "__main__":
     main()
+    
