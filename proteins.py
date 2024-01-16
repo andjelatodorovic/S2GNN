@@ -434,13 +434,13 @@ def test(model, data, y_true, split_idx, evaluator):
 def create_subgraph(data, subset_percentage):
     # Calculate the number of nodes in the subset
     #num_nodes_subset = int(subset_percentage * data.num_nodes)
-    num_nodes_subset = 10000
+    num_nodes_subset = 30000
     # Select a subset of nodes based on the calculated number
     subset_nodes = torch.arange(num_nodes_subset)
 
     # Extract the subgraph
     subset_edge_index, subset_edge_attr = subgraph(subset_nodes, data.edge_index, edge_attr=data.edge_attr, num_nodes=data.num_nodes)
-
+    print(subset_edge_index.shape)
     # Create a new data object for the subgraph
     subset_data = torch_geometric.data.Data(
         x=data.x[subset_nodes],
@@ -469,7 +469,7 @@ def main():
     
 
     parser = argparse.ArgumentParser(description='OGBN-Proteins (Cheby)')
-    parser.add_argument('--model', type=str, default='Cheby',
+    parser.add_argument('--model', type=str, default='SGC',
                             help='Name of graph neural network: SSobGNN, SobGNN, GCN, Cheby, kGNN,'
                                 'GAT, Transformer, SGC, ClusterGCN, FiLM, SuperGAT, GATv2, ARMA, SIGN')
     parser.add_argument('--aggregation', type=str, default='linear')
@@ -546,10 +546,12 @@ def main():
     logger = Logger(args.runs, args)
     scaler = GradScaler()
 
-    for run in range(args.runs):  # Use args.runs instead of hardcoded 11
+    total_time_excluding_first_run = 0
+    num_runs_excluding_first = args.runs - 1 if args.runs > 1 else 0
+
+    for run in range(args.runs):
         start_time = time.time()  # Start time of the run
 
-        # Reset model parameters for each run, if applicable
         model = get_model(args.model, x.size(-1), 112, args.num_layers, args).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
@@ -561,7 +563,7 @@ def main():
                 logger.add_result(run, result)
 
                 if epoch % args.log_steps == 0:
-                    train_rocauc, valid_rocauc, test_rocauc= result
+                    train_rocauc, valid_rocauc, test_rocauc = result
                     print(f'Run: {run + 1:02d}, '
                           f'Epoch: {epoch:02d}, '
                           f'Loss: {loss:.4f}, '
@@ -569,14 +571,20 @@ def main():
                           f'Valid: {100 * valid_rocauc:.2f}% '
                           f'Test: {100 * test_rocauc:.2f}%')
 
-        gc.collect()
-        end_time = time.time()  # End time of the run
-        run_time = end_time - start_time  # Calculate the time taken for this run
-        print(f'Time for run {run + 1:02d}: {run_time:.2f} seconds')  # Print the time for the run
+
+        run_time = time.time() - start_time  # Time for this run
+        print(f'Time for run {run + 1:02d}: {run_time:.2f} seconds')
+
+        if run > 0:  # Exclude the first run
+            total_time_excluding_first_run += run_time
 
         logger.print_statistics(run)
-    logger.print_statistics()
 
+    # Average time calculation
+    average_time_per_run = total_time_excluding_first_run / num_runs_excluding_first if num_runs_excluding_first > 0 else 0
+    print(f'Average time per run (excluding first run): {average_time_per_run:.2f} seconds')
+
+    logger.print_statistics()
     logger.close()
 
 if __name__ == "__main__":
